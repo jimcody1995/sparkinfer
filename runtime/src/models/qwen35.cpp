@@ -373,6 +373,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
                 else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14)
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, pst);
+                else if (t == 8)
+                    kernels::launch_gemv_q(s.xn, W, 8, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -392,6 +394,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 } else if (s.use_pq && s.use_llama && s.use_q6mmvq && t == 14) {
                     kernels::launch_quantize_q8_1_blocks(x, s.aq81, K, st);
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, K, st);
+                } else if (t == 8) {
+                    kernels::launch_gemv_q(x, W, 8, y, N, K, st);
                 } else if (t) kernels::launch_gemv_q(x, W, t, y, N, K, st);
                 else          kernels::launch_gemv(x, W, y, N, K, st);
             } else {
@@ -531,6 +535,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
                     kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.wo, s.ao, H, s.qdim, st);
                 }
             }
+            else if (s.gguf && w.wo_type == 8)
+                kernels::launch_gemv_q(s.attn, w.wo, 8, s.ao, H, s.qdim, st);
             else if (s.gguf && w.wo_type) kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, s.qdim, st);
             else if (s.gguf)         kernels::launch_gemv(s.attn, w.wo, s.ao, H, s.qdim, st);
             else                     kernels::launch_gemm(s.attn, w.wo, s.ao, 1, H, s.qdim, 1.f, 0.f, gc, st);
@@ -906,15 +912,16 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     // uses ~1.5 GB less VRAM. Set SPARKINFER_QATTN=0 to load dense bf16 instead.
     const bool qattn = []{ const char* a = getenv("SPARKINFER_QATTN");
                            return !(a && a[0] == '0'); }();
+    // Q8_0 (8) joins Q4_K/Q6_K on the keep-raw dp4a path for UD-quant attention/GDN projections.
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
-        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
-        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14)) return dev_quant(name, type);
+        if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8)) return dev_quant(name, type);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {

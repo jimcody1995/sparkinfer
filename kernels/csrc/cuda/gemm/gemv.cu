@@ -128,9 +128,20 @@ __global__ void gemv_q_kernel(const __nv_bfloat16* __restrict__ x,
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int n = blockIdx.x * GEMV_WPB + warp;
     if (n >= N) return;
+    float acc = 0.f;
+    if (wtype == 8) {   // Q8_0 native [N,K]: K/32 blocks of 34 B, fp32 activation (matches bf16 dequant GEMV)
+        const int nb = K >> 5;
+        const unsigned char* row = W + (size_t)n * nb * 34;
+        for (int blk = lane; blk < nb; blk += 32) {
+            const unsigned char* b = row + (size_t)blk * 34;
+            const float d = gq_h2f(b);
+            const float* sx = s_x + blk * 32;
+            #pragma unroll
+            for (int j = 0; j < 32; j++) acc += d * (float)((signed char)b[2 + j]) * sx[j];
+        }
+    } else {
     const int nblk = K / 256, bb = gq_block_bytes(wtype);
     const unsigned char* base = W + (size_t)n * nblk * bb;
-    float acc = 0.f;
     // dequant in registers and FMA straight against the activation — no shared
     // round-trip, one warp-reduce at the end. Reads the quantized row coalesced.
     for (int blk = 0; blk < nblk; blk++) {
@@ -165,6 +176,7 @@ __global__ void gemv_q_kernel(const __nv_bfloat16* __restrict__ x,
                 acc += (d2 * (qb >> 4)  - mm2) * sx[g*64 + 32 + lane];
             }
         }
+    }
     }
     #pragma unroll
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
@@ -431,6 +443,48 @@ __global__ void si_mmvq_q4k_kernel(const si_block_q8_1* __restrict__ vy, const u
 
 template __global__ void si_mmvq_q4k_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
 template __global__ void si_mmvq_q4k_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
+
+// ---- faithful llama.cpp Q8_0 x Q8_1 dp4a mmvq (opt-in via SPARKINFER_Q80_MMVQ=1) ----
+__device__ __forceinline__ float si_q80_h2f(const unsigned char* p) {
+    __half h; *reinterpret_cast<unsigned short*>(&h) = *reinterpret_cast<const unsigned short*>(p);
+    return __half2float(h);
+}
+__device__ __forceinline__ int si_q80_ld4(const unsigned char* p) {
+    int v; memcpy(&v, p, sizeof(v)); return v;
+}
+__device__ __forceinline__ float si_vec_dot_q8_0(const unsigned char* wblk, const si_block_q8_1* ablk) {
+    const float d_w = si_q80_h2f(wblk);
+    const float d_a = __low2float(ablk->ds);
+    const unsigned char* qw = wblk + 2;
+    const unsigned char* qa = reinterpret_cast<const unsigned char*>(ablk->qs);
+    int sumi = 0;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) sumi = __dp4a(si_q80_ld4(qw + k * 4), si_q80_ld4(qa + k * 4), sumi);
+    return d_w * d_a * (float)sumi;
+}
+template <typename OutT>
+__global__ void si_mmvq_q80_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
+                                   OutT* __restrict__ y, int N, int K) {
+    constexpr int NW = 4, WS = 32;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int nb = K >> 5;
+    const unsigned char* w_row = W + (size_t)row * nb * 34;
+    float tmp = 0.0f;
+    for (int kb = tid; kb < nb; kb += NW * WS)
+        tmp += si_vec_dot_q8_0(w_row + (size_t)kb * 34, vy + kb);
+    __shared__ float tmp_shared[NW - 1][WS];
+    if (warp > 0) tmp_shared[warp - 1][lane] = tmp;
+    __syncthreads();
+    if (warp > 0) return;
+    #pragma unroll
+    for (int l = 0; l < NW - 1; l++) tmp += tmp_shared[l][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0) gemv_write(y + row, tmp);
+}
+template __global__ void si_mmvq_q80_kernel<__nv_bfloat16>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int, int);
+template __global__ void si_mmvq_q80_kernel<float>(const si_block_q8_1*, const unsigned char*, float*, int, int);
 
 template <typename OutT, int NSUPER>
 __global__ void si_mmvq_q4k_kfixed_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
@@ -757,6 +811,15 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
     if (K == 2048)      si_mmvq_q4k_kfixed_kernel<float, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else if (K == 4096) si_mmvq_q4k_kfixed_kernel<float, 16><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else                si_mmvq_q4k_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
+}
+void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
+    si_mmvq_q80_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W),
+        reinterpret_cast<__nv_bfloat16*>(y), N, K);
+}
+void launch_mmvq_q80_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
+    si_mmvq_q80_kernel<float><<<N, 4 * 32, 0, stream>>>(
+        reinterpret_cast<const si_block_q8_1*>(q81), reinterpret_cast<const unsigned char*>(W), y, N, K);
 }
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
